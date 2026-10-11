@@ -1,0 +1,117 @@
+# Banco XYZ - arquitectura de microservicios
+#   gateway (8080) -> auth-service | bff-service (x2) | batch-service
+#   Kafka (mensajeria) + PostgreSQL (datos)
+x-bff: &bff
+  build: ./bff-service
+  environment: &bff-env
+    BATCH_SERVICE_URL: http://batch-service:8080
+    KAFKA_BOOTSTRAP: kafka:29092
+    JWT_SECRET: ${JWT_SECRET:?Define JWT_SECRET en el archivo .env}
+  depends_on:
+    kafka:
+      condition: service_healthy
+    batch-service:
+      condition: service_started
+  restart: on-failure
+  networks:
+    - banco-net
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: banco
+      POSTGRES_USER: banco
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Esquema de metadatos de Spring Batch (se ejecuta solo la primera vez que se crea el volumen)
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U banco -d banco"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - banco-net
+
+  kafka:
+    image: apache/kafka:3.8.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks:
+      - banco-net
+
+  auth-service:
+    build: ./auth-service
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?Define JWT_SECRET en el archivo .env}
+      AUTH_WEB_PASSWORD: ${AUTH_WEB_PASSWORD:?Define AUTH_WEB_PASSWORD en .env}
+      AUTH_MOBILE_PASSWORD: ${AUTH_MOBILE_PASSWORD:?Define AUTH_MOBILE_PASSWORD en .env}
+      AUTH_ATM_PASSWORD: ${AUTH_ATM_PASSWORD:?Define AUTH_ATM_PASSWORD en .env}
+    restart: on-failure
+    networks:
+      - banco-net
+
+  batch-service:
+    build: ./batch-service
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/banco
+      DB_USER: banco
+      DB_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
+      KAFKA_BOOTSTRAP: kafka:29092
+      JWT_SECRET: ${JWT_SECRET:?Define JWT_SECRET en el archivo .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: on-failure
+    networks:
+      - banco-net
+
+  # Dos replicas del BFF (escalabilidad horizontal). El gateway reparte entre ambas.
+  bff-service-1:
+    <<: *bff
+  bff-service-2:
+    <<: *bff
+
+  gateway:
+    build: ./gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      - auth-service
+      - batch-service
+      - bff-service-1
+      - bff-service-2
+    restart: on-failure
+    networks:
+      - banco-net
+
+volumes:
+  pgdata:
+
+networks:
+  banco-net:
+    driver: bridge
